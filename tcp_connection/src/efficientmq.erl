@@ -2,7 +2,7 @@
 
 -module(efficientmq).
 -export([context/0, term/0, socket/2, bind/2, connect/2, send_message/2, receive_message/1]).
--export([close/1]).
+-export([proxy/3, close/1]).
 
 context() -> % creates the context
     application:start(sasl),
@@ -120,7 +120,10 @@ receive_message(ConnectionPID) ->
 			{message, {connection_proxy, ConnectionReplierPID}, Message}
     end.
 
-
+proxy({sub, FrontendManagerPID}, {pub, BackendManagerPID}, _Capture=null) ->
+	gen_server:cast(BackendManagerPID, {proxy_start, FrontendManagerPID}),
+	gen_server:cast(FrontendManagerPID, {proxy_start, BackendManagerPID}),
+	timer:sleep(infinity).
 
 close({connection, ConnectionPID}) ->
 	gen_server:cast(ConnectionPID, stop);

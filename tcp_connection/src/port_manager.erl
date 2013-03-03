@@ -21,6 +21,7 @@
 				receive_msg_sender_pid = undefined ::pid(),
 				queue_read_iterator = '$end_of_table', % ets table index
 				queueTableID,  % ets table
+				peer_manager_PID = undefined       ::pid(), % pid of the of the peer when using a proxy
 				roundrobin_queueID = undefined     ::pid() % pid of the receiving process
 		}).
 
@@ -162,6 +163,20 @@ handle_cast({receive_msg, SenderPID}, #state{direction=outgoing, type=req}=State
 handle_cast({receive_msg, SenderPID}, #state{direction=outgoing, type=rep}=State) ->
     gen_server:cast(State#state.outgoing_connnection_pid, {receive_msg, SenderPID}),
     {noreply, State};
+handle_cast({proxy_start, _PeerManagerPID}, #state{direction=incoming, type=pub}=State) ->
+	%% ignore
+	{noreply, State};
+handle_cast({proxy_start, PeerManagerPID}, #state{direction=incoming, type=sub}=State) ->
+	NewState1 = State#state{peer_manager_PID = PeerManagerPID},
+	NewState2 = dequeue_and_forward_proxy_message(NewState1),
+	{noreply, NewState2};	
+handle_cast({proxy_forward_message, PeerManagerPID, BytesBin}, #state{type = pub, direction=incoming}=State) ->
+	ok = send_multicast_messages(State#state.pid_list, {send_message, BytesBin}), 
+	gen_server:cast(PeerManagerPID, proxy_forward_message_ack),
+    {noreply, State};	
+handle_cast(proxy_forward_message_ack, #state{type = sub, direction=incoming}=State) -> 
+	NewState = dequeue_and_forward_proxy_message(State),
+	{noreply, NewState};
 handle_cast({forward_message, ReplyerPID, BytesBin}, #state{type = sub, direction=incoming}=State) ->
 	NewState = evaluate_forward_message(ReplyerPID, BytesBin, State),
     {noreply, NewState};
@@ -245,9 +260,14 @@ evaluate_forward_message(ReplyerPID, BytesBin, State) ->
 	QueueIdentifier = ReplyerPID,
 	case State#state.receive_msg_sender_pid of
 		undefined ->
-			NewQueue = lib_module:queue_element(BytesBin, lib_module:get_queue(State#state.queueTableID, QueueIdentifier), ?CREDITS), 
-		    lib_module:set_queue(State#state.queueTableID, QueueIdentifier, NewQueue),
-		    NewState = State;
+		    NewQueue = lib_module:queue_element(BytesBin, lib_module:get_queue(State#state.queueTableID, QueueIdentifier), ?CREDITS), 
+			lib_module:set_queue(State#state.queueTableID, QueueIdentifier, NewQueue),
+			case State#state.peer_manager_PID of
+				undefined ->
+					NewState = State;
+				_PeerManagerPID ->
+				    NewState = dequeue_and_forward_proxy_message(State)
+				end;
 		ReceiverPID ->
 			%error_logger:info_msg("evaluate_forward_message ReceiverPID~p~n",[ReceiverPID]),
 		    ReceiverPID ! {received_message_ack, ReplyerPID, BytesBin},
@@ -280,6 +300,37 @@ evaluate_receive_message(SenderPID, State)->
 		    NewState = State#state{roundrobin_queueID = KeyPID},
 		    BytesBin = Queue_element,
 		    SenderPID ! {received_message_ack, ReplyerPID, BytesBin},
+			gen_server:cast(ReplyerPID, {flowcontrol,1})
+			%error_logger:info_msg("KeyPID:~p~n",[KeyPID]),
+			%error_logger:info_msg("ETStable:~p~n",[ets:tab2list(State#state.queueTableID)])
+	end,
+	NewState.
+
+
+dequeue_and_forward_proxy_message(State)->
+	QueueIdentifier = State#state.roundrobin_queueID,
+	Res = lib_module:getNextElementInQueueRoundRobin(State#state.queueTableID, QueueIdentifier),
+	%error_logger:info_msg("getNextElementInQueueRoundRobin Res:~p~n",[Res]),
+	case Res of 
+		{all_queues_empty, '$end_of_table'}->
+			KeyPID = ets:first(State#state.queueTableID),
+			NewState = State#state{roundrobin_queueID = KeyPID}; 
+			%error_logger:info_msg("KeyPID:~p~n",[KeyPID]),
+			%error_logger:info_msg("ETStable:~p~n",[ets:tab2list(State#state.queueTableID)]);
+		{all_queues_empty, KeyPID}->
+			case State#state.receive_msg_sender_pid of 
+				undefined ->
+					%error_logger:info_msg("Storing SenderPID ~p~n",[SenderPID]),
+					NewState = State#state{roundrobin_queueID = KeyPID};		
+				_Other ->
+					error_logger:error_report("Already waiting for message reception Error!!"),
+					NewState = State#state{roundrobin_queueID = KeyPID}
+			end;
+		{queue_element, KeyPID, Queue_element} ->
+			ReplyerPID = KeyPID,
+		    NewState = State#state{roundrobin_queueID = KeyPID},
+		    BytesBin = Queue_element,
+		    gen_server:cast(NewState#state.peer_manager_PID, {proxy_forward_message, self(), BytesBin}),
 			gen_server:cast(ReplyerPID, {flowcontrol,1})
 			%error_logger:info_msg("KeyPID:~p~n",[KeyPID]),
 			%error_logger:info_msg("ETStable:~p~n",[ets:tab2list(State#state.queueTableID)])
